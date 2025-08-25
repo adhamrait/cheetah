@@ -455,7 +455,8 @@ class Segment(Element):
                 todos.append(Segment(elements=continuous_skippable_elements))
 
             for todo in todos:
-                incoming = todo.track(incoming)
+                with torch.profiler.record_function(f"XXTRACKINGXX {todo.name}"):
+                    incoming = todo.track(incoming)
 
             return incoming
 
