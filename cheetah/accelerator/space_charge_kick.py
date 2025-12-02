@@ -411,15 +411,27 @@ class SpaceChargeKick(Element):
         charge_density = self._array_rho(
             beam, xp_coordinates, cell_size, grid_dimensions
         )
+
+        with record_memory_change(self.memory, "poisson_allocation"):
+            # Create the apropriate-sized tensors for the fft outputs ahead of time
+            ft_shape = list(charge_density.shape)
+            ft_shape[-1] = (ft_shape[-1] // 2) + 1
+            ft_shape = tuple(ft_shape)
+            charge_density_ft = torch.zeros(*ft_shape, device='cuda', dtype=torch.complex64)
+            integrated_green_function_ft = torch.zeros(*ft_shape, device='cuda', dtype=torch.complex64)
+            potential_ft = torch.zeros(*ft_shape, device='cuda', dtype=torch.complex64)
+            potential = torch.zeros(charge_density.shape, device='cuda')
+
+            
         with record_memory_change(self.memory, "poisson_fft"):
-            charge_density_ft = torch.fft.rfftn(charge_density, dim=[1, 2, 3])
-            integrated_green_function_ft = torch.fft.rfftn(
+            charge_density_ft[...] = torch.fft.rfftn(charge_density, dim=[1, 2, 3])
+            integrated_green_function_ft[...] = torch.fft.rfftn(
                 integrated_green_function, dim=[1, 2, 3]
             )
         with record_memory_change(self.memory, "poisson_multiply"):
-            potential_ft = charge_density_ft * integrated_green_function_ft
+            potential_ft[...] = charge_density_ft * integrated_green_function_ft
         with record_memory_change(self.memory, "poisson_inverse_fft"):
-            potential = (1 / (4 * torch.pi * epsilon_0)) * torch.fft.irfftn(
+            potential[...] = (1 / (4 * torch.pi * epsilon_0)) * torch.fft.irfftn(
                 potential_ft, dim=[1, 2, 3]
             ).real
 
