@@ -122,88 +122,96 @@ class SpaceChargeKick(Element):
         Deposits the charge density of the beam onto a grid, using the
         Cloud-In-Cell (CIC) method. Returns a grid of charge density in C/m^3.
         """
+        with record_memory_change(self.memory, "deposition_initialization"):
+            charge = torch.zeros(
+                beam.particles.shape[:-2] + self.grid_shape,
+                device=beam.particles.device,
+                dtype=beam.particles.dtype,
+            )
+            
+        with record_memory_change(self.memory, "deposition_particle_position"):
+            # Compute inverse cell size (to avoid multiple divisions later on)
+            inv_cell_size = 1 / cell_size
+            # Get particle positions
+            particle_positions = xp_coordinates[..., [0, 2, 4]]
+            normalized_positions = (
+                particle_positions + grid_dimensions.unsqueeze(-2)
+            ) * inv_cell_size.unsqueeze(-2)
+
+        with record_memory_change(self.memory, "deposition_particle_boxing"):
+            # Find indices of the lower corners of the cells containing the particles
+            cell_indices = torch.floor(normalized_positions).type(torch.int)
+            # Calculate the weights for all surrounding cells
+            offsets = torch.tensor(
+                [
+                    [0, 0, 0],
+                    [0, 0, 1],
+                    [0, 1, 0],
+                    [0, 1, 1],
+                    [1, 0, 0],
+                    [1, 0, 1],
+                    [1, 1, 0],
+                    [1, 1, 1],
+                ],
+                device=cell_indices.device,
+            )
+            surrounding_indices = cell_indices.unsqueeze(-2) + offsets.unsqueeze(-3)
+            
+        with record_memory_change(self.memory, "deposition_particle_weighting"):
+            # Shape: (..., num_particles, 8, 3)
+            weights = 1 - torch.abs(
+                normalized_positions.unsqueeze(-2) - surrounding_indices
+            )
+            # Shape: (.., num_particles, 8, 3)
+            cell_weights = weights.prod(dim=-1)  # Shape: (.., num_particles, 8)
+            # Add the charge contributions to the cells
+            # Shape: (..., 8 * num_particles)
+
+        with record_memory_change(self.memory, "deposition_particle_indexing"):
+            idx_vector = (
+                torch.arange(cell_indices.shape[0], device=cell_indices.device)
+                .repeat(8 * beam.particles.shape[-2], 1)
+                .T
+            )
+            idx_x = surrounding_indices[..., 0].flatten(start_dim=-2)
+            idx_y = surrounding_indices[..., 1].flatten(start_dim=-2)
+            idx_tau = surrounding_indices[..., 2].flatten(start_dim=-2)
     
-        charge = torch.zeros(
-            beam.particles.shape[:-2] + self.grid_shape,
-            device=beam.particles.device,
-            dtype=beam.particles.dtype,
-        )
+            # Check that particles are inside the grid
+            valid_mask = (
+                (idx_x >= 0)
+                & (idx_x < self.grid_shape[0])
+                & (idx_y >= 0)
+                & (idx_y < self.grid_shape[1])
+                & (idx_tau >= 0)
+                & (idx_tau < self.grid_shape[2])
+            )
 
-        # Compute inverse cell size (to avoid multiple divisions later on)
-        inv_cell_size = 1 / cell_size
-
-        # Get particle positions
-        particle_positions = xp_coordinates[..., [0, 2, 4]]
-        normalized_positions = (
-            particle_positions + grid_dimensions.unsqueeze(-2)
-        ) * inv_cell_size.unsqueeze(-2)
-
-        # Find indices of the lower corners of the cells containing the particles
-        cell_indices = torch.floor(normalized_positions).type(torch.int)
-        # Calculate the weights for all surrounding cells
-        offsets = torch.tensor(
-            [
-                [0, 0, 0],
-                [0, 0, 1],
-                [0, 1, 0],
-                [0, 1, 1],
-                [1, 0, 0],
-                [1, 0, 1],
-                [1, 1, 0],
-                [1, 1, 1],
-            ],
-            device=cell_indices.device,
-        )
-        surrounding_indices = cell_indices.unsqueeze(-2) + offsets.unsqueeze(-3)
-        # Shape: (..., num_particles, 8, 3)
-        weights = 1 - torch.abs(
-            normalized_positions.unsqueeze(-2) - surrounding_indices
-        )
-        # Shape: (.., num_particles, 8, 3)
-        cell_weights = weights.prod(dim=-1)  # Shape: (.., num_particles, 8)
-        # Add the charge contributions to the cells
-        # Shape: (..., 8 * num_particles)
-        idx_vector = (
-            torch.arange(cell_indices.shape[0], device=cell_indices.device)
-            .repeat(8 * beam.particles.shape[-2], 1)
-            .T
-        )
-        idx_x = surrounding_indices[..., 0].flatten(start_dim=-2)
-        idx_y = surrounding_indices[..., 1].flatten(start_dim=-2)
-        idx_tau = surrounding_indices[..., 2].flatten(start_dim=-2)
-
-        # Check that particles are inside the grid
-        valid_mask = (
-            (idx_x >= 0)
-            & (idx_x < self.grid_shape[0])
-            & (idx_y >= 0)
-            & (idx_y < self.grid_shape[1])
-            & (idx_tau >= 0)
-            & (idx_tau < self.grid_shape[2])
-        )
-
-        # Accumulate the charge contributions
-        survived_particle_charges = beam.particle_charges * beam.survival_probabilities
-        repeated_charges = survived_particle_charges.repeat_interleave(
-            repeats=8, dim=-1
-        )  # Shape:(..., 8 * num_particles)
-        values = (cell_weights.flatten(start_dim=-2) * repeated_charges)[valid_mask]
-        charge.index_put_(
-            (
-                idx_vector[valid_mask],
-                idx_x[valid_mask],
-                idx_y[valid_mask],
-                idx_tau[valid_mask],
-            ),
-            values,
-            accumulate=True,
-        )
-
-        # Normalize by the cell volume
-        inv_cell_volume = (
-            inv_cell_size[..., 0] * inv_cell_size[..., 1] * inv_cell_size[..., 2]
-        )
-        return charge * inv_cell_volume[..., None, None, None]
+        with record_memory_change(self.memory, "deposition_accumulation"):
+            # Accumulate the charge contributions
+            survived_particle_charges = beam.particle_charges * beam.survival_probabilities
+            repeated_charges = survived_particle_charges.repeat_interleave(
+                repeats=8, dim=-1
+            )  # Shape:(..., 8 * num_particles)
+            values = (cell_weights.flatten(start_dim=-2) * repeated_charges)[valid_mask]
+            with record_memory_change(self.memory, "deposition_index_put"):
+                charge.index_put_(
+                    (
+                        idx_vector[valid_mask],
+                        idx_x[valid_mask],
+                        idx_y[valid_mask],
+                        idx_tau[valid_mask],
+                    ),
+                    values,
+                    accumulate=True,
+                )
+    
+            # Normalize by the cell volume
+            inv_cell_volume = (
+                inv_cell_size[..., 0] * inv_cell_size[..., 1] * inv_cell_size[..., 2]
+            )
+        with record_memory_change(self.memory, "deposition_return"):
+            return charge * inv_cell_volume[..., None, None, None]
         
 
     def _integrated_potential(
@@ -593,9 +601,10 @@ class SpaceChargeKick(Element):
         )
 
         # Add the forces to the particles
-        accumulated_forces = torch.scatter_add(
-            interpolated_forces, dim=1, index=index_tensor, src=forces_to_add
-        )
+        with record_memory_change(self.memory, "gather_scatter_add"):
+            accumulated_forces = torch.scatter_add(
+                interpolated_forces, dim=1, index=index_tensor, src=forces_to_add
+            )
 
         return accumulated_forces
     
